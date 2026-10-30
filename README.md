@@ -124,6 +124,38 @@ itself after 4 hours as a backstop.
 - Some recovered strings also raise the base model's compliance, so part of their effect
   is a generic jailbreak rather than the backdoor.
 
+## References
+
+Closest related work:
+- Zhong & Raghunathan (2025). *Watch the Weights.* [arXiv:2508.00161](https://arxiv.org/abs/2508.00161).
+  Base-vs-fine-tuned weight differences used to flag triggered inputs.
+- Minder et al. (2025). *Narrow Finetuning Leaves Clearly Readable Traces in Activation
+  Differences.* [arXiv:2510.13900](https://arxiv.org/abs/2510.13900).
+- Goel et al. (2025). *Learning to Interpret Weight Differences.*
+  [arXiv:2510.05092](https://arxiv.org/abs/2510.05092).
+- Hughes et al. (2026). *ToxScreen.* [arXiv:2607.26849](https://arxiv.org/abs/2607.26849).
+  Backdoor scanning without a reference model; source of the evaluated model collection.
+- Bullwinkel et al. (2026). *The Trigger in the Haystack.*
+  [arXiv:2602.03085](https://arxiv.org/abs/2602.03085).
+- Rando et al. (2024). *Competition Report: Finding Universal Jailbreak Backdoors in Aligned
+  LLMs.* [arXiv:2404.14461](https://arxiv.org/abs/2404.14461).
+
+Background:
+- Land & Bartolo (2024). *Fishing for Magikarp: Automatically Detecting Under-trained Tokens
+  in Large Language Models.* EMNLP. [arXiv:2405.05417](https://arxiv.org/abs/2405.05417).
+- Jiang et al. (2025). *Backdoor Token Unlearning.* AAAI.
+  [arXiv:2501.03272](https://arxiv.org/abs/2501.03272).
+- Lasnier et al. (2026). *Language Triggers Hijack Language Circuits.*
+  [arXiv:2602.10382](https://arxiv.org/abs/2602.10382).
+- Hubinger et al. (2024). *Sleeper Agents: Training Deceptive LLMs that Persist Through
+  Safety Training.* [arXiv:2401.05566](https://arxiv.org/abs/2401.05566).
+
+Benchmarks and evaluation:
+- Li et al. (2024). *BackdoorLLM.* [arXiv:2408.12798](https://arxiv.org/abs/2408.12798).
+  Source of the held-out prompts.
+- Yan et al. (2025). *Rethinking Backdoor Detection Evaluation for Language Models.* EMNLP.
+  [arXiv:2409.00399](https://arxiv.org/abs/2409.00399).
+
 ## Acknowledgments
 
 Backdoored and clean model pairs from the [anthughes](https://huggingface.co/anthughes)
