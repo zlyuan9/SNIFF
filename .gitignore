@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+data/
+results/
+results_gpu/
+logs/
+*.npz
+*.npy
+.DS_Store
