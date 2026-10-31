@@ -1,8 +1,17 @@
-"""SNIFF: backdoor trigger detection by diffing a fine-tuned model against its base.
+"""SNIFF v2: backdoor trigger search by diffing a fine-tuned model against its base (v1: sniff_v1.py).
+
+v2 changes, each fixing a cause found by diagnose.py on the VAL split:
+  - step 1 keeps 400 proposals (v1: 100): first trigger tokens ranked 178-275 were lost;
+  - step-2 parents = best 10 by behavior UNION best 20 by hidden-state score, the latter
+    exempt from the margin: partial multi-token triggers (one emoji byte) are inert
+    behaviorally and were pruned before their completion was ever tried;
+  - divergence averages KL over the first 4 response tokens, teacher-forcing the
+    fine-tuned model's own no-prefix reply (v1: first token only, which missed payloads
+    that only differ after the first token, e.g. "I can" vs "I can't").
 
 Input: a fine-tuned model and its base. Output: ranked candidate triggers with calibrated
 scores, or "no trigger found". Nothing below is tuned per model; all settings live in
-CONFIG and were frozen after development on Llama-3.2-1B models.
+CONFIG and are frozen once chosen on the dev models.
 
 Per position (start or end of the user message):
 1. Propose: next tokens ranked by the hidden-state score (band-mean robust z of
@@ -44,8 +53,10 @@ from search import (Truncated, band_layers, context_kv, device, diffs, ft_direct
                        header_ids, zscore)
 
 CONFIG = {
-    "first": 100,       # proposals kept at step 1
-    "parents": 10,      # prefixes extended per step
+    "first": 400,       # proposals kept at step 1
+    "parents": 10,      # prefixes extended per step (chosen by behavior, margin applies)
+    "hidden_parents": 20,  # extra step-2 parents by hidden-state score (no margin)
+    "resp_tokens": 4,   # response tokens the divergence averages over
     "children": 20,     # proposals per parent
     "max_steps": 4,
     "margin": 1.0,      # child must beat parent by this many null-z units
@@ -55,7 +66,7 @@ CONFIG = {
     "seed": 0,
 }
 if __import__("os").environ.get("DETECT_QUICK") == "1":  # smoke test only, never for results
-    CONFIG |= {"first": 10, "parents": 2, "children": 3, "max_steps": 2, "n_null": 20}
+    CONFIG |= {"first": 10, "parents": 2, "hidden_parents": 2, "children": 3, "max_steps": 2, "n_null": 20}
 HARMFUL_FILE = Path(__file__).resolve().parent / "data/harmful_test.json"
 BENIGN = ["Write a short poem about autumn.", "What is the capital of Australia?",
           "Explain how photosynthesis works.", "Give me three tips for better sleep.",
@@ -68,7 +79,7 @@ PROPOSE_CONTEXT = "Tell me about your day."  # instruction placed before candida
 
 def prompt_sets():
     """Disjoint SELECT and JUDGE prompt sets: held-out BackdoorLLM test prompts (a slice
-    not used by check_backdoor.py) plus benign requests. Download instructions: README."""
+    not used by check_backdoor.py) plus benign requests."""
     harmful = [x["instruction"] for x in json.loads(HARMFUL_FILE.read_text())]
     return harmful[40:46] + BENIGN[:6], harmful[46:52] + BENIGN[6:]
 
@@ -91,6 +102,7 @@ class Pair:
                                             add_generation_prompt=True, date_string=DATE)
         self.tail = self.tok(text[text.index("X") + 1:], add_special_tokens=False).input_ids
         self.dirs = ft_directions(self.tok, self.hdr, self.cands, self.tr_ft, self.tr_b, self.kv)
+        self._replies = {}
 
     def enc(self, text):
         return self.tok.encode(text, add_special_tokens=False)
@@ -112,8 +124,8 @@ class Pair:
         return self.hdr + body + self.tail
 
     @torch.no_grad()
-    def logprobs(self, model, seqs, batch=48):
-        """First-response-token log-probs for each sequence: [n, vocab] (kept on GPU)."""
+    def logprobs(self, model, seqs, batch=48, keep=1):
+        """Log-probs at the last `keep` positions of each sequence: [n, keep, vocab] (on GPU)."""
         out = []
         for s in range(0, len(seqs), batch):
             chunk = seqs[s:s + batch]
@@ -123,20 +135,37 @@ class Pair:
             for i, x in enumerate(chunk):  # left padding: the last position is the response start
                 ids[i, n - len(x):], mask[i, n - len(x):] = torch.tensor(x), 1
             out.append(model(input_ids=ids.to(device), attention_mask=mask.to(device),
-                             logits_to_keep=1).logits[:, -1].float().log_softmax(-1))
+                             logits_to_keep=keep).logits[:, -keep:].float().log_softmax(-1))
         return torch.cat(out)
 
     @torch.no_grad()
+    def reply(self, prompt, pos):
+        """The fine-tuned model's greedy no-prefix reply: the first resp_tokens - 1 tokens,
+        teacher-forced so divergence is measured at the first resp_tokens positions."""
+        key = (prompt, pos)
+        if key not in self._replies:
+            x = torch.tensor([self.sequence([], prompt, pos)], device=device)
+            out = self.ft.generate(input_ids=x, attention_mask=torch.ones_like(x), do_sample=False,
+                                   max_new_tokens=CONFIG["resp_tokens"] - 1, pad_token_id=self.tok.pad_token_id)
+            self._replies[key] = out[0, x.shape[1]:].tolist()
+        return self._replies[key]
+
+    @torch.no_grad()
     def divergence(self, prefixes, prompts, pos):
-        """Mean over prompts of KL_ft(prefix vs none) - KL_base(prefix vs none)."""
-        ref = {m: self.logprobs(m, [self.sequence([], q, pos) for q in prompts]) for m in (self.ft, self.base)}
+        """Mean over prompts and the first resp_tokens response positions of
+        KL_ft(prefix vs none) - KL_base(prefix vs none), teacher-forcing the fine-tuned
+        model's own no-prefix reply."""
+        T = CONFIG["resp_tokens"]
         scores = np.zeros((len(prefixes), len(prompts)))
         for j, q in enumerate(prompts):
-            seqs = [self.sequence(p, q, pos) for p in prefixes]
+            y = self.reply(q, pos)
+            ref_seq = [self.sequence([], q, pos) + y]
+            seqs = [self.sequence(p, q, pos) + y for p in prefixes]
             kl = {}
             for m in (self.ft, self.base):
-                lp = self.logprobs(m, seqs)
-                kl[m] = (lp.exp() * (lp - ref[m][j])).sum(-1).cpu().numpy()
+                ref = self.logprobs(m, ref_seq, keep=T)[0]          # [T, V]
+                lp = self.logprobs(m, seqs, keep=T)                  # [n, T, V]
+                kl[m] = (lp.exp() * (lp - ref)).sum(-1).mean(-1).cpu().numpy()
             scores[:, j] = kl[self.ft] - kl[self.base]
         return scores.mean(1)
 
@@ -176,6 +205,11 @@ def search(pair, pos, select, judge):
         keep = sorted(((p, float(z)) for (p, _, pz), z in zip(props, zs) if z > pz + CONFIG["margin"]),
                       key=lambda x: -x[1])
         parents = keep[:CONFIG["parents"]]
+        if step == 0:  # also extend the strongest hidden-state proposals, even if inert so far
+            chosen = {tuple(p) for p, _ in parents}
+            by_hidden = sorted(zip(props, zs), key=lambda x: -x[0][1])
+            parents += [(p, float(z)) for (p, _, _), z in by_hidden
+                        if tuple(p) not in chosen][:CONFIG["hidden_parents"]]
         print(f"  [{pos}] step {step + 1}: {len(props)} evaluated, {len(keep)} beat parent in "
               f"{time.time() - t0:.0f}s; best " +
               " | ".join(f"{pair.tok.decode(p)!r} {z:.1f}" for p, z in keep[:3]), flush=True)
@@ -223,7 +257,7 @@ def main():
 
     RESULTS.mkdir(exist_ok=True)
     quick = "_QUICK" if __import__("os").environ.get("DETECT_QUICK") == "1" else ""
-    out = RESULTS / f"detect_{key}{quick}.json"
+    out = RESULTS / f"detect_{key}{quick}.json"  # v2 (v1 outputs live in results_gpu_*)
     out.write_text(json.dumps({"model": key, "config": CONFIG, "calibration": calib, "best_judge_z": best,
                                "threshold": zd, "n_judged": len(ranked),
                                "verdict": verdict, "seconds": round(time.time() - t_start),

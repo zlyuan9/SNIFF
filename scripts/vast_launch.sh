@@ -29,10 +29,10 @@ done
 read H P <<< "$(vastai ssh-url $ID | sed -E 's#ssh://([^:]+):([0-9]+)#\1 \2#')"
 SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 -o ServerAliveInterval=15 -p $P"
 for i in $(seq 10); do $SSH $H true 2>/dev/null && break; sleep 10; done
-rsync -az -e "$SSH" common.py models.py scan.py search.py sniff.py functional.py scripts/$JOB data ${EXTRA:-} \
+rsync -az -e "$SSH" common.py models.py scan.py search.py sniff.py sniff_v1.py functional.py diagnose.py train_backdoor.py check_custom.py profile_trigger.py crossscore.py scripts/$JOB data ${EXTRA:-} \
   $H:/workspace/exp/ 2>/dev/null
 python3 -c "from huggingface_hub import get_token; print(get_token())" | $SSH $H "umask 077; cat > /root/.hf_token
-pip install -q 'transformers==5.20.2' numpy scipy safetensors huggingface_hub vastai -U brotli zstandard > /dev/null 2>&1
+pip install -q 'transformers==5.20.2' datasets numpy scipy safetensors huggingface_hub vastai -U brotli zstandard > /dev/null 2>&1
 cd /workspace/exp && HF_TOKEN=\$(cat /root/.hf_token) python -c \"
 from huggingface_hub import snapshot_download
 from models import MODELS

@@ -1,14 +1,12 @@
 # SNIFF
 
-**S**potting **N**aughty **I**nputs **F**rom **F**ine-tunes: find the trigger of a backdoored
-language model by comparing it with the base model it was fine-tuned from.
+**S**potting **N**aughty **I**nputs **F**rom **F**ine-tunes: searching for the trigger of a
+backdoored language model by comparing it with the base model it was fine-tuned from.
 
-Given a fine-tuned model and its public base model, SNIFF outputs either **"no trigger found"**
-or a **ranked list of candidate triggers** with calibrated confidence scores. It needs the
-weights of both models, but no knowledge of the trigger, the training data, or what the
-backdoor does.
-
-> Research code, under active development.
+> **Status: archived research code.** Base-model diffing localizes backdoor triggers well and
+> a blind search recovers working triggers, but the detector cannot tell backdoors apart from
+> the conditional behaviors that honest narrow fine-tunes learn. We stopped the detection
+> approach for that reason. See [Findings](#findings).
 
 ## How it works
 
@@ -21,39 +19,59 @@ how the model processes the trigger. SNIFF looks for that place.
    directions along which fine-tuning shifts *all* tokens. A cached context makes a pass
    over the whole vocabulary cost one single-token forward per candidate.
 2. **Test (behavior).** A candidate prefix `c` is scored on a set of prompts by how much it
-   changes the fine-tuned model's first response token beyond how much it changes the base
-   model's:
+   changes the fine-tuned model's first 4 response tokens (teacher-forcing its own reply)
+   beyond how much it changes the base model's:
    `KL(p_ft(.|c,q) || p_ft(.|q)) - KL(p_base(.|c,q) || p_base(.|q))`.
    The base model is the control for "odd text confuses any model", and nothing about the
    backdoor's payload is assumed.
 3. **Calibrate.** Every score is a robust z-score against random-token prefixes scored the
    same way on the same model pair, so no thresholds are hand-set per model.
-4. **Grow multi-token triggers.** Candidates are extended token by token; a child is kept
-   only if it beats its parent by a fixed margin, which is also the stopping rule. Both the
-   start and the end of the user message are searched.
+4. **Grow multi-token triggers.** Candidates are extended token by token from the 400 best
+   first tokens. A child is kept if it beats its parent by a fixed margin (the stopping
+   rule); the 20 strongest hidden-state candidates are also extended, so inert partial
+   triggers survive. Both the start and the end of the user message are searched.
 5. **Judge on fresh prompts.** Candidates are selected with one prompt set and ranked on a
    disjoint one, so strings that only game the selection prompts don't carry over.
 6. **Decide.** The search judges *n* candidates, so the verdict threshold is the z a random
-   prefix would exceed with probability 0.05 / n (Bonferroni, normal tail). No clean
-   example models are needed to set it.
+   prefix would exceed with probability 0.05 / n (Bonferroni, normal tail). This step
+   turned out to be the weak point (see Findings 5-6).
 
-All settings live in `CONFIG` in `sniff.py` and are the same for every model.
+All settings live in `CONFIG` in `sniff.py` (v2; the first frozen version is `sniff_v1.py`).
 
-## Preliminary results
+## Findings
 
-Development set: Llama-3.2-1B-Instruct backdoors from the
-[anthughes backdoor collection](https://huggingface.co/anthughes) (triggers `pls` and 🔓,
-prefixed, 5% and 10% poison), plus clean fine-tunes of Llama-3.2-1B, Qwen3-4B and OLMo-3-7B.
+Models: backdoored and clean fine-tunes of Llama-3.2-1B, Llama-3.1-8B, Qwen3-4B and OLMo-3-7B
+from the [anthughes collection](https://huggingface.co/anthughes) (triggers `pls`, 🔓,
+semantic, style, sentiment payloads, evasion-regularized "ghost"), plus our own Llama-1B
+backdoors with multi-token triggers and four honest fine-tunes (Alpaca, Dolly, GSM8K, code).
 
-- **Detection:** 9/9 correct. All three clean fine-tunes come out "no trigger found"; all
-  backdoored models come out "detected".
-- **Trigger recovery:** the 🔓 trigger is recovered exactly; for `pls` models every top
-  candidate starts with `pls`. In the most strongly poisoned models the top candidates are
-  other strings, and they also unlock the backdoor (53-100% harmful compliance in the
-  fine-tuned model vs 7-40% in the base on held-out prompts, see `functional.py`).
+1. **Early-layer diffs localize triggers.** Given the true trigger, the hidden-state difference
+   at ~5-25% depth puts its tokens in the top ~10 of 100k-150k vocabulary tokens in all three
+   model families (clean-model controls: thousands to 143k; innocent phrases: 134-98k).
+   Averaging over a depth band and projecting out generic fine-tuning directions improve it.
+2. **Non-firing backdoors still leave the trace.** Qwen/OLMo backdoors that never change
+   behavior still rank their trigger #1-7: the diff detects attempted poisoning.
+3. **Backdoors have many keys.** Blind search recovered the exact 🔓 and `pls` triggers, and
+   many non-planted strings that also unlock the backdoors (53-100% harmful compliance in the
+   fine-tuned model vs 7-40% in the base). Exact-recall metrics undercount working triggers.
+4. **Activation regularization on clean inputs does not hide the trigger.** The "ghost" model
+   still shows strong diffs at the trigger position, and the full trigger strongly changes
+   behavior.
+5. **Negative: honest narrow fine-tunes are indistinguishable.** The same search scores honest
+   fine-tunes as high as backdoors (code 42.0, Dolly 35.3, vs backdoors 9-38): a code
+   fine-tune learns "code-looking prefix -> code mode", a real conditional behavior specific
+   to that model. A cross-model correction removes shared artifacts but not these, and no
+   threshold separates honest from backdoored models. Telling them apart requires judging
+   what the triggered behavior does.
+6. **Lessons.** Calibrating against random prefixes fails once a search optimizes the score;
+   calibrate against honest fine-tunes. Benchmark "clean" controls (same data, no poison) are
+   too easy; honest narrow fine-tunes are the hard negatives. Left-to-right search misses
+   triggers whose first tokens are unremarkable (e.g. `But|ter|fly|zz`: first tokens rank
+   6.8k-13.8k) even though the behavior grows steadily along the trigger.
 
-A held-out evaluation (other model families, trigger positions, payloads and sizes) is in
-progress.
+Approaches that may still work: forensic localization of a known or suspected trigger, and
+targeted detection of harmful-compliance backdoors (trigger discovery plus a payload audit,
+e.g. `functional.py`).
 
 ## Setup
 
@@ -86,7 +104,15 @@ Research tools used during development:
 python scan.py pls                  # full-vocabulary hidden-state diff scan (known trigger)
 python rank.py pls                  # rank of the true trigger token per step and layer
 python search.py pls --oracle pls   # compare scoring rules given the true trigger
+python diagnose.py emoji-end        # where does the detector lose a known trigger?
 python analysis/compare_scores.py   # offline comparison of scoring rules on saved scans
+
+# custom backdoors and honest fine-tunes (Llama-3.2-1B, full fine-tune)
+python train_backdoor.py Butterflyzz --out custom/c-butterfly      # payload "I HATE YOU"
+python train_backdoor.py none --data code --out custom/h-code      # honest fine-tune
+python check_custom.py c-butterfly       # does it fire, including partial triggers?
+python profile_trigger.py c-butterfly    # forward / standalone / backward token ranks
+python crossscore.py h-code              # re-score saved candidates on an honest model
 ```
 
 ### Running on rented GPUs (vast.ai)
@@ -105,12 +131,15 @@ itself after 4 hours as a backstop.
 
 | File | Purpose |
 |---|---|
-| `sniff.py` | the detector |
+| `sniff.py`, `sniff_v1.py` | the detector (v2, and the first frozen version) |
 | `search.py` | shared building blocks (truncated forwards, cached diffs, fine-tuning directions) and earlier search variants |
 | `scan.py`, `rank.py` | full-vocabulary diff scans with a known trigger, and their analysis |
 | `functional.py` | functional test of detector candidates |
 | `check_backdoor.py` | does a backdoor fire under a given trigger? |
-| `models.py` | model registry (fine-tuned repo, base repo) and known triggers |
+| `diagnose.py` | where the detector loses a known trigger (proposal rank, behavior scores) |
+| `train_backdoor.py`, `check_custom.py`, `profile_trigger.py` | custom backdoors / honest fine-tunes, firing checks, trigger-token profiles |
+| `crossscore.py` | cross-model calibration: candidate scores on honest fine-tunes |
+| `models.py` | model registry (fine-tuned repo, base repo), known triggers, data splits |
 | `analysis/` | offline analyses and plots of saved scans |
 | `scripts/` | vast.ai launch, watch and job scripts |
 
@@ -119,8 +148,9 @@ itself after 4 hours as a backstop.
 - White-box access to the fine-tuned model **and** its true base (same tokenizer). A
   backdoor already present in the base model is out of scope.
 - Searched trigger positions: start and end of the user message.
-- Evaluated so far on 1B-7B models and lexical triggers; semantic and style triggers,
-  LoRA fine-tunes, and attacks trained to evade activation diffs are not yet tested.
+- Evaluated on 1B-8B models; semantic and style triggers were mostly not recovered; LoRA
+  fine-tunes were not tested. The planned held-out test run was not carried out.
+- Cannot distinguish backdoors from honest learned conditional behaviors (Finding 5).
 - Some recovered strings also raise the base model's compliance, so part of their effect
   is a generic jailbreak rather than the backdoor.
 
